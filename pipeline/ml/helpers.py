@@ -2,7 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader, random_split
 from transformers import BertTokenizer, BertForSequenceClassification, AdamW, get_linear_schedule_with_warmup
-
+from pyspark.sql.functions import col
+import numpy as np
 import lightgbm as lgb
 
 
@@ -115,16 +116,13 @@ def predict_bert(data, model, device):
     return bert_variable
 
 
-def fit_lgbm(train_df, model, device):
+def fit_lgbm(train_df):
     """
     Fits the LGBM model on train data
     :param train_df: Spark dataframe
-    :param model: BERT model to generate probabilities
-    :param device: Cpu or Gpu
     :return: LGBM model
     """
     train = train_df.toPandas()
-    train['bert_variable'] = predict_bert(train_df, model, device)
     genres_to_keep = ['drama', 'horror', 'biography', 'noir', 'comedy', 'unknown', 'sci-fi']
     all_genres = train.iloc[:, 18:].columns.values
     genres_to_remove = set(all_genres) - set(genres_to_keep)
@@ -142,22 +140,46 @@ def fit_lgbm(train_df, model, device):
     return clf
 
 
-def predict_lgbm(data, lgbm_model, bert_model, device):
+def predict_lgbm(data, lgbm_model):
     """
     Inference using LGBM on unknown data
     :param data: Spark dataframe
     :param lgbm_model: LGBM model
-    :param bert_model: BERT model
-    :param device: Cpu or Gpu for BERT model
     :return: list
     """
+
     genres_to_keep = ['drama', 'horror', 'biography', 'noir', 'comedy', 'unknown', 'sci-fi']
-    all_genres_val = data.iloc[:, 19:].columns.values
-    genres_to_remove_val = set(all_genres_val) - set(genres_to_keep)
+    cols_to_select = ['genres'] + ['col{}'.format(i) for i in range(19, 34)]
+
+    data = data.select(cols_to_select).withColumn("genres", col("genres").cast("array<string>")) \
+        .withColumn("genres_filtered", col("genres") \
+                    .array_intersect(genres_to_keep)) \
+        .drop("genres") \
+        .select(*(col("genres_filtered")[i].alias("genre_{}".format(i)) \
+                  for i in range(len(genres_to_keep)))) \
+        .fillna(0)
+    data = data.drop("col0", "tconst", "primaryTitle", "startYear", "plot")
 
     data = data.toPandas()
-    data['bert_variable'] = predict_bert(data, bert_model, device)
-    data = data.drop(list(genres_to_remove_val), axis=1)
-    data = data.drop(['Unnamed: 0', 'tconst', 'primaryTitle', 'startYear', 'plot'], axis=1)
 
     return lgbm_model.predict(data)
+
+
+def ensemble(bert_validations, bert_tests, lgbm_validation, lgbm_test):
+    """
+    Ensemble model using different weights for each model:
+    0.125*bert_1 + 0.125*bert_2 + 0.125*bert_3 + 0.125*bert_4 + 0.5*lightGBM
+    :param bert_validations: List containing all results for the validation for each BERT model
+    :param bert_tests: List containing all results for the hidden test for each BERT model
+    :param lgbm_validation: List containing results for the validation test for LGBM model
+    :param lgbm_test: List containing results for the hidden test for LGBM model
+    :return:
+    """
+    combined_validation_4berts = np.round(
+        np.array(bert_validations[0]) * 0.125 + np.array(bert_validations[1]) * 0.125 + np.array(
+            bert_validations[2]) * 0.125 + np.array(bert_validations[3]) * 0.125 + lgbm_validation * 0.5)
+
+    combined_test_4berts = np.round(np.array(bert_tests[0]) * 0.125 + np.array(bert_tests[1]) * 0.125 + np.array(
+        bert_tests[2]) * 0.125 + np.array(bert_tests[3]) * 0.125 + lgbm_test * 0.5)
+
+    return combined_validation_4berts, combined_test_4berts
